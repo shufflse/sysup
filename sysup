@@ -1,0 +1,154 @@
+#!/bin/bash
+# sysup – Universal system updater
+
+LOGFILE="$HOME/.sysup.log"
+exec > >(tee -a "$LOGFILE") 2>&1
+
+# Colours
+BOLD="\033[1m"; DIM="\033[2m"; RED="\033[31m"; GREEN="\033[32m"
+YELLOW="\033[33m"; CYAN="\033[36m"; RESET="\033[0m"
+
+declare -A updaters=(
+  [apt]="sudo apt update && sudo apt upgrade -y"
+  [dnf]="sudo dnf upgrade -y"
+  [pacman]="sudo pacman -Syu --noconfirm"
+  [yay]="yay -Syu --noconfirm"
+  [paru]="paru -Syu --noconfirm"
+  [zypper]="sudo zypper refresh && sudo zypper update -y"
+  [brew]="brew update && brew upgrade"
+  [flatpak]="flatpak update -y"
+  [npm]="sudo npm update -g"
+  [pnpm]="pnpm update -g"
+  [yarn]="yarn global upgrade"
+  [cargo]="cargo install-update -a"
+  [gem]="gem update"
+  [go]="go get -u all"
+)
+
+# Conflict groups
+declare -a parallel_groups=(
+  "apt dnf pacman yay paru zypper"
+  "brew flatpak"
+  "npm pnpm yarn"
+  "cargo gem go"
+)
+
+DRY_RUN=false; SKIP_SUDO=false; VERBOSE=false
+ONLY=(); SKIP=()
+
+usage() {
+  echo -e "${BOLD}sysup – Universal system updater${RESET}"
+  echo "  -h, --help"
+  echo "  -v, --verbose"
+  echo "  -d, --dry-run"
+  echo "  -o, --only LIST"
+  echo "  -s, --skip LIST"
+  echo "  -n, --no-sudo"
+}
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -h|--help) usage; exit 0 ;;
+    -v|--verbose) VERBOSE=true ;;
+    -d|--dry-run) DRY_RUN=true ;;
+    -o|--only) shift; IFS=',' read -ra ONLY <<< "$1" ;;
+    --only=*) IFS=',' read -ra ONLY <<< "${1#*=}" ;;
+    -s|--skip) shift; IFS=',' read -ra SKIP <<< "$1" ;;
+    --skip=*) IFS=',' read -ra SKIP <<< "${1#*=}" ;;
+    -n|--no-sudo) SKIP_SUDO=true ;;
+    *) echo -e "${RED}Unknown option:${RESET} $1"; usage; exit 1 ;;
+  esac
+  shift
+done
+
+# Keep‑alive sudo
+if ! $SKIP_SUDO; then
+  sudo -v || { echo -e "${RED}❌ Sudo failed.${RESET}"; exit 1; }
+  ( while true; do sudo -v; sleep 60; done ) & SUDO_PID=$!
+  trap 'kill $SUDO_PID' EXIT
+fi
+
+# Build active list
+ACTIVE_MANAGERS=()
+for pm in "${!updaters[@]}"; do
+  if [[ ${#ONLY[@]} -gt 0 ]]; then
+    [[ " ${ONLY[*]} " != *" $pm "* ]] && continue
+  fi
+  [[ " ${SKIP[*]} " == *" $pm "* ]] && continue
+  command -v "$pm" &>/dev/null && ACTIVE_MANAGERS+=("$pm")
+done
+
+TOTAL=${#ACTIVE_MANAGERS[@]}
+(( TOTAL == 0 )) && { echo -e "${YELLOW}⚠ No managers found.${RESET}"; exit 0; }
+
+# HUD helpers
+start_time=$(date +%s)
+calc_eta() {
+  local done=$1 total=$2 elapsed=$(( $(date +%s) - start_time ))
+  (( done == 0 )) && { printf -- "--:--"; return; }
+  local avg=$((elapsed / done))
+  local remain=$((total - done))
+  printf "%02d:%02d" $(( (avg*remain)/60 )) $(( (avg*remain)%60 ))
+}
+
+VISIBLE_MANAGERS=("${ACTIVE_MANAGERS[@]}")
+draw_ui() {
+  local current=$1 total=$2
+  local cols=$(tput cols)
+  local percent=$(( current * 100 / total ))
+  local bar_width=$(( cols - 20 )); (( bar_width < 10 )) && bar_width=10
+  local filled=$(( bar_width * current / total ))
+  local empty=$(( bar_width - filled ))
+
+  tput sc
+  tput cup $(( $(tput lines) - 2 )) 0; tput el
+  printf "${CYAN}Remaining:${RESET} ${YELLOW}%s${RESET}" "${VISIBLE_MANAGERS[*]}"
+  tput cup $(( $(tput lines) - 1 )) 0; tput el
+  printf "%3d%% ${YELLOW}" "$percent"
+  printf "%0.s█" $(seq 1 $filled)
+  printf "${DIM}%0.s░" $(seq 1 $empty)
+  printf "${RESET} ETA:%s" "$(calc_eta "$current" "$total")"
+  tput rc
+}
+
+# Kick off runs & map PIDs
+COMPLETED=0
+draw_ui 0 "$TOTAL"
+PIDS=()
+declare -A PM_FOR_PID
+
+for pm in "${ACTIVE_MANAGERS[@]}"; do
+  if $DRY_RUN; then
+    echo "${DIM}${updaters[$pm]}${RESET}" &
+  elif $VERBOSE; then
+    eval "${updaters[$pm]}" &
+  else
+    eval "${updaters[$pm]}" &>/dev/null &
+  fi
+  pid=$!
+  PIDS+=("$pid")
+  PM_FOR_PID["$pid"]="$pm"
+done
+
+# Event loop
+while ((${#PIDS[@]})); do
+  if wait -n; then
+    for i in "${!PIDS[@]}"; do
+      pid="${PIDS[$i]}"
+      if ! kill -0 "$pid" 2>/dev/null; then
+        finished_pm="${PM_FOR_PID[$pid]}"
+        unset 'PIDS[i]'
+        VISIBLE_MANAGERS=("${VISIBLE_MANAGERS[@]/$finished_pm}")
+        ((COMPLETED++))
+        draw_ui "$COMPLETED" "$TOTAL"
+      fi
+    done
+    PIDS=("${PIDS[@]}") 
+  fi
+done
+
+draw_ui "$TOTAL" "$TOTAL"
+tput cup "$(tput lines)" 0
+echo -e "\n${GREEN}🎉 All updates finished.${RESET}"
+
