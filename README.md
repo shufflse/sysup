@@ -1,39 +1,27 @@
 # sysup – Universal System Updater 🛠️
 
-`sysup` is a cross‑manager system update tool.  
+`sysup` is a cross‑manager system update tool that automatically detects available package managers on your system and runs updates.  
 
-It automatically detects available package managers and runs updates.
-
-I'm not very good at writing shell scripts so any suggestions and help would be great.
-
-
-## ✨ Features
-
-- **Multi‑manager updates** in a single run (`apt`, `dnf`, `brew`, `flatpak`, `npm`, etc.)
-- **Robust argument parsing** with both short and long flags
-- **Selective updates**: run only specific managers or skip others
-- **Verbose mode** to match your workflow
-- **Sudo keep‑alive** for uninterrupted privileged operations
 
 ---
 
 ## 📦 Installation
 
-Clone this repo and install `sysup` to a directory in your `$PATH`:
+Place `sysup` in a directory in your `$PATH`.  
+For a system‑wide install (recommended), copy it to `/usr/local/bin`:
 
 ```bash
 git clone https://github.com/shufflse/sysup.git
 cd sysup
-sudo mkdir -p ~/.local/bin
-sudo cp sysup ~/.local/bin/sysup
-sudo chmod +x ~/.local/bin/sysup
+sudo cp sysup /usr/local/bin/sysup
+sudo chmod +x /usr/local/bin/sysup
 ```
 
 ---
 
 ## 🚀 Usage
 
-Basic full‑system update:
+Run a full update across all detected managers:
 
 ```bash
 sysup
@@ -51,13 +39,7 @@ Skip certain managers:
 sysup --skip npm,yarn
 ```
 
-Test the command set without running updates:
-
-```bash
-sysup --dry-run
-```
-
-Verbose output (scrolls above the pinned UI):
+Show full output from each manager:
 
 ```bash
 sysup --verbose
@@ -71,10 +53,9 @@ sysup --verbose
 |---------------------|-------------|
 | `-h`, `--help`      | Show help & usage info |
 | `-v`, `--verbose`   | Show full package manager output |
-| `-d`, `--dry-run`   | Print commands, don’t execute |
 | `-o`, `--only LIST` | Run only these managers (comma‑separated) |
 | `-s`, `--skip LIST` | Skip these managers |
-| `-n`, `--no-sudo`   | Skip sudo keep‑alive |
+| `-c`, `--edit-config` | Edit your per‑user config file in `$EDITOR` |
 
 ---
 
@@ -83,24 +64,23 @@ sysup --verbose
 `sysup` currently detects and can run updates for:
 
 ```
-apt   dnf   pacman   yay   paru
+apt   dnf   pacman   yay   paru   zypper
 brew  flatpak
 npm   pnpm  yarn
 cargo gem   go
-zypper
 ```
 
-Only managers found on your system will be executed.
+Only managers found on your system will be executed.  
+If both `yay`/`paru` and `pacman` are present, `pacman` will be skipped to avoid duplicate runs.
 
 ---
 
 ## 📊 Progress UI
 
 ```
-⏳ Remaining: npm, dnf         
- 50% ██████░░░░░░░░░░░░░░░░░░ ETA: 00:05 
+⏳ Remaining: npm, dnf
+ 50% ██████░░░░░░░░░░░░░░░░░░ ETA: 00:05
 ```
 
-- **Line 1**: Remaining package managers
-- **Line 2**: Percentage, ETA
-
+- **Line 1**: Remaining package managers  
+- **Line 2**: Percentage complete, progress bar, and estimated time remaining
