@@ -1,5 +1,7 @@
 #!/bin/bash
-# sysup – Universal system updater
+# sysup – Universal system updater (terminal sudo first if needed, conflict-safe, config-aware)
+
+set -o pipefail
 
 LOGFILE="$HOME/.sysup.log"
 exec > >(tee -a "$LOGFILE") 2>&1
@@ -8,16 +10,41 @@ exec > >(tee -a "$LOGFILE") 2>&1
 BOLD="\033[1m"; DIM="\033[2m"; RED="\033[31m"; GREEN="\033[32m"
 YELLOW="\033[33m"; CYAN="\033[36m"; RESET="\033[0m"
 
+# Config
+CONFIG_DIR="$HOME/.config"
+CONFIG_FILE="$CONFIG_DIR/sysup.conf"
+
+init_config() {
+  mkdir -p "$CONFIG_DIR"
+  cat > "$CONFIG_FILE" <<'EOF'
+# sysup configuration file
+# Comma-separated lists; leave empty for none
+ONLY=()
+SKIP=()
+# Verbose output: true/false
+VERBOSE=false
+EOF
+  echo -e "${GREEN}✔ Created default config at $CONFIG_FILE${RESET}"
+}
+
+[[ ! -f "$CONFIG_FILE" ]] && init_config
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+
+VERBOSE=${VERBOSE:-false}
+declare -a ONLY SKIP
+
+# Updaters (no sudo here — handled per-manager at runtime)
 declare -A updaters=(
-  [apt]="sudo apt update && sudo apt upgrade -y"
-  [dnf]="sudo dnf upgrade -y"
-  [pacman]="sudo pacman -Syu --noconfirm"
+  [apt]="apt update && apt upgrade -y"
+  [dnf]="dnf upgrade -y"
+  [pacman]="pacman -Syu --noconfirm"
   [yay]="yay -Syu --noconfirm"
   [paru]="paru -Syu --noconfirm"
-  [zypper]="sudo zypper refresh && sudo zypper update -y"
+  [zypper]="zypper refresh && zypper update -y"
   [brew]="brew update && brew upgrade"
   [flatpak]="flatpak update -y"
-  [npm]="sudo npm update -g"
+  [npm]="npm update -g"
   [pnpm]="pnpm update -g"
   [yarn]="yarn global upgrade"
   [cargo]="cargo install-update -a"
@@ -25,7 +52,10 @@ declare -A updaters=(
   [go]="go get -u all"
 )
 
-# Conflict groups
+# Managers that require root
+root_required=(apt dnf pacman zypper npm)
+
+# Conflict groups (sequential groups; members run in parallel)
 declare -a parallel_groups=(
   "apt dnf pacman yay paru zypper"
   "brew flatpak"
@@ -33,17 +63,24 @@ declare -a parallel_groups=(
   "cargo gem go"
 )
 
-DRY_RUN=false; SKIP_SUDO=false; VERBOSE=false
-ONLY=(); SKIP=()
-
 usage() {
-  echo -e "${BOLD}sysup – Universal system updater${RESET}"
-  echo "  -h, --help"
-  echo "  -v, --verbose"
-  echo "  -d, --dry-run"
-  echo "  -o, --only LIST"
-  echo "  -s, --skip LIST"
-  echo "  -n, --no-sudo"
+  echo -e "${BOLD}sysup – Universal system updater${RESET}
+
+Usage:
+  sysup [options]
+
+Options:
+  -h, --help         Show this help message and exit
+  -v, --verbose      Show full output from each package manager
+  -o, --only LIST    Comma-separated list of managers to run (e.g. apt,flatpak)
+  -s, --skip LIST    Comma-separated list of managers to skip (e.g. brew,yarn)
+  -c, --edit-config  Edit your sysup configuration in \$EDITOR
+
+Examples:
+  sysup                  Run updates for all detected managers
+  sysup -o apt,flatpak   Update only apt and flatpak
+  sysup -s brew          Update everything except Homebrew
+  sysup -v               Show full output from each updater"
 }
 
 # Parse args
@@ -51,23 +88,18 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     -h|--help) usage; exit 0 ;;
     -v|--verbose) VERBOSE=true ;;
-    -d|--dry-run) DRY_RUN=true ;;
     -o|--only) shift; IFS=',' read -ra ONLY <<< "$1" ;;
     --only=*) IFS=',' read -ra ONLY <<< "${1#*=}" ;;
     -s|--skip) shift; IFS=',' read -ra SKIP <<< "$1" ;;
     --skip=*) IFS=',' read -ra SKIP <<< "${1#*=}" ;;
-    -n|--no-sudo) SKIP_SUDO=true ;;
+    -c|--edit-config)
+      "${EDITOR:-nano}" "$CONFIG_FILE"
+      exit 0
+      ;;
     *) echo -e "${RED}Unknown option:${RESET} $1"; usage; exit 1 ;;
   esac
   shift
 done
-
-# Keep‑alive sudo
-if ! $SKIP_SUDO; then
-  sudo -v || { echo -e "${RED}❌ Sudo failed.${RESET}"; exit 1; }
-  ( while true; do sudo -v; sleep 60; done ) & SUDO_PID=$!
-  trap 'kill $SUDO_PID' EXIT
-fi
 
 # Build active list
 ACTIVE_MANAGERS=()
@@ -76,11 +108,37 @@ for pm in "${!updaters[@]}"; do
     [[ " ${ONLY[*]} " != *" $pm "* ]] && continue
   fi
   [[ " ${SKIP[*]} " == *" $pm "* ]] && continue
-  command -v "$pm" &>/dev/null && ACTIVE_MANAGERS+=("$pm")
+  command -v "$pm" &>/dev/null || continue
+  # Skip pacman if yay/paru present (to avoid double-running pacman)
+  if [[ "$pm" == "pacman" ]] && (command -v yay &>/dev/null || command -v paru &>/dev/null); then
+    continue
+  fi
+  ACTIVE_MANAGERS+=("$pm")
 done
 
-TOTAL=${#ACTIVE_MANAGERS[@]}
-(( TOTAL == 0 )) && { echo -e "${YELLOW}⚠ No managers found.${RESET}"; exit 0; }
+(( ${#ACTIVE_MANAGERS[@]} == 0 )) && { echo -e "${YELLOW}⚠ No managers found.${RESET}"; exit 0; }
+
+# Determine if root is needed by any selected manager
+NEEDS_ROOT=false
+for pm in "${ACTIVE_MANAGERS[@]}"; do
+  if [[ " ${root_required[*]} " =~ " $pm " ]]; then
+    NEEDS_ROOT=true
+    break
+  fi
+done
+
+# If needed, perform sudo auth first and keep it alive during run
+SUDO_PID=""
+if $NEEDS_ROOT; then
+  echo -e "${CYAN}🔑 Authenticating for root-required managers...${RESET}"
+  if ! command -v sudo &>/dev/null; then
+    echo -e "${RED}❌ 'sudo' not found. Install sudo or run managers individually with root.${RESET}"
+    exit 1
+  fi
+  sudo -v || { echo -e "${RED}❌ Sudo authentication failed.${RESET}"; exit 1; }
+  ( while true; do sudo -n true; sleep 60; done ) & SUDO_PID=$!
+  trap '[[ -n "$SUDO_PID" ]] && kill "$SUDO_PID" 2>/dev/null || true' EXIT
+fi
 
 # HUD helpers
 start_time=$(date +%s)
@@ -95,60 +153,82 @@ calc_eta() {
 VISIBLE_MANAGERS=("${ACTIVE_MANAGERS[@]}")
 draw_ui() {
   local current=$1 total=$2
-  local cols=$(tput cols)
+  local cols=$(tput cols 2>/dev/null || echo 80)
+  local lines=$(tput lines 2>/dev/null || echo 24)
   local percent=$(( current * 100 / total ))
   local bar_width=$(( cols - 20 )); (( bar_width < 10 )) && bar_width=10
   local filled=$(( bar_width * current / total ))
   local empty=$(( bar_width - filled ))
 
-  tput sc
-  tput cup $(( $(tput lines) - 2 )) 0; tput el
+  tput sc 2>/dev/null || true
+  tput cup $(( lines - 2 )) 0 2>/dev/null || true; tput el 2>/dev/null || true
   printf "${CYAN}Remaining:${RESET} ${YELLOW}%s${RESET}" "${VISIBLE_MANAGERS[*]}"
-  tput cup $(( $(tput lines) - 1 )) 0; tput el
+  tput cup $(( lines - 1 )) 0 2>/dev/null || true; tput el 2>/dev/null || true
   printf "%3d%% ${YELLOW}" "$percent"
   printf "%0.s█" $(seq 1 $filled)
   printf "${DIM}%0.s░" $(seq 1 $empty)
   printf "${RESET} ETA:%s" "$(calc_eta "$current" "$total")"
-  tput rc
+  tput rc 2>/dev/null || true
 }
 
-# Kick off runs & map PIDs
+# Execution
 COMPLETED=0
+FAILURES=()
+TOTAL=${#ACTIVE_MANAGERS[@]}
 draw_ui 0 "$TOTAL"
-PIDS=()
-declare -A PM_FOR_PID
 
-for pm in "${ACTIVE_MANAGERS[@]}"; do
-  if $DRY_RUN; then
-    echo "${DIM}${updaters[$pm]}${RESET}" &
-  elif $VERBOSE; then
-    eval "${updaters[$pm]}" &
-  else
-    eval "${updaters[$pm]}" &>/dev/null &
-  fi
-  pid=$!
-  PIDS+=("$pid")
-  PM_FOR_PID["$pid"]="$pm"
-done
+for group in "${parallel_groups[@]}"; do
+  group_pms=()
+  for pm in $group; do
+    [[ " ${ACTIVE_MANAGERS[*]} " == *" $pm "* ]] && group_pms+=("$pm")
+  done
+  (( ${#group_pms[@]} == 0 )) && continue
 
-# Event loop
-while ((${#PIDS[@]})); do
-  if wait -n; then
+  PIDS=()
+  declare -A PM_FOR_PID
+
+  for pm in "${group_pms[@]}"; do
+    cmd="${updaters[$pm]}"
+    if [[ " ${root_required[*]} " =~ " $pm " ]]; then
+      cmd="sudo bash -lc \"$cmd\""
+    else
+      cmd="bash -lc \"$cmd\""
+    fi
+
+    if $VERBOSE; then
+      eval "$cmd" &
+    else
+      eval "$cmd" &>/dev/null &
+    fi
+
+    pid=$!
+    PIDS+=("$pid")
+    PM_FOR_PID["$pid"]="$pm"
+  done
+
+  # Wait for this group's managers to finish
+  while ((${#PIDS[@]})); do
     for i in "${!PIDS[@]}"; do
       pid="${PIDS[$i]}"
       if ! kill -0 "$pid" 2>/dev/null; then
+        wait "$pid"
+        status=$?
         finished_pm="${PM_FOR_PID[$pid]}"
-        unset 'PIDS[i]'
         VISIBLE_MANAGERS=("${VISIBLE_MANAGERS[@]/$finished_pm}")
         ((COMPLETED++))
+        [[ $status -ne 0 ]] && FAILURES+=("$finished_pm")
         draw_ui "$COMPLETED" "$TOTAL"
+        unset 'PIDS[i]'
       fi
     done
-    PIDS=("${PIDS[@]}") 
-  fi
+    PIDS=("${PIDS[@]}")  # compact
+    sleep 0.1
+  done
 done
 
 draw_ui "$TOTAL" "$TOTAL"
-tput cup "$(tput lines)" 0
-echo -e "\n${GREEN}🎉 All updates finished.${RESET}"
-
+tput cup "$(tput lines 2>/dev/null || echo 24)" 0 2>/dev/null || true
+echo -e "\n${GREEN}✔ Updates finished.${RESET}"
+if (( ${#FAILURES[@]} > 0 )); then
+  echo -e "${RED}❌ Failed:${RESET} ${FAILURES[*]}"
+fi
