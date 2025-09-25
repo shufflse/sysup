@@ -1,5 +1,5 @@
 #!/bin/bash
-# sysup – Universal system updater (terminal sudo first if needed, conflict-safe, config-aware)
+# sysup – Universal system updater 
 
 set -o pipefail
 
@@ -34,7 +34,7 @@ source "$CONFIG_FILE"
 VERBOSE=${VERBOSE:-false}
 declare -a ONLY SKIP
 
-# Updaters (no sudo here — handled per-manager at runtime)
+# Updaters 
 declare -A updaters=(
   [apt]="apt update && apt upgrade -y"
   [dnf]="dnf upgrade -y"
@@ -55,7 +55,7 @@ declare -A updaters=(
 # Managers that require root
 root_required=(apt dnf pacman zypper npm)
 
-# Conflict groups (sequential groups; members run in parallel)
+# Conflict groups 
 declare -a parallel_groups=(
   "apt dnf pacman yay paru zypper"
   "brew flatpak"
@@ -121,7 +121,7 @@ done
 # Determine if root is needed by any selected manager
 NEEDS_ROOT=false
 for pm in "${ACTIVE_MANAGERS[@]}"; do
-  if [[ " ${root_required[*]} " =~ " $pm " ]]; then
+  if [[ " ${root_required[*]} " == *" $pm "* ]]; then
     NEEDS_ROOT=true
     break
   fi
@@ -177,55 +177,60 @@ FAILURES=()
 TOTAL=${#ACTIVE_MANAGERS[@]}
 draw_ui 0 "$TOTAL"
 
-for group in "${parallel_groups[@]}"; do
+# Build groups of active managers
+declare -a group_list=()
+declare -A group_members
+
+for idx in "${!parallel_groups[@]}"; do
   group_pms=()
-  for pm in $group; do
+  for pm in ${parallel_groups[$idx]}; do
     [[ " ${ACTIVE_MANAGERS[*]} " == *" $pm "* ]] && group_pms+=("$pm")
   done
   (( ${#group_pms[@]} == 0 )) && continue
-
-  PIDS=()
-  declare -A PM_FOR_PID
-
-  for pm in "${group_pms[@]}"; do
-    cmd="${updaters[$pm]}"
-    if [[ " ${root_required[*]} " =~ " $pm " ]]; then
-      cmd="sudo bash -lc \"$cmd\""
-    else
-      cmd="bash -lc \"$cmd\""
-    fi
-
-    if $VERBOSE; then
-      eval "$cmd" &
-    else
-      eval "$cmd" &>/dev/null &
-    fi
-
-    pid=$!
-    PIDS+=("$pid")
-    PM_FOR_PID["$pid"]="$pm"
-  done
-
-  # Wait for this group's managers to finish
-  while ((${#PIDS[@]})); do
-    for i in "${!PIDS[@]}"; do
-      pid="${PIDS[$i]}"
-      if ! kill -0 "$pid" 2>/dev/null; then
-        wait "$pid"
-        status=$?
-        finished_pm="${PM_FOR_PID[$pid]}"
-        VISIBLE_MANAGERS=("${VISIBLE_MANAGERS[@]/$finished_pm}")
-        ((COMPLETED++))
-        [[ $status -ne 0 ]] && FAILURES+=("$finished_pm")
-        draw_ui "$COMPLETED" "$TOTAL"
-        unset 'PIDS[i]'
-      fi
-    done
-    PIDS=("${PIDS[@]}")  # compact
-    sleep 0.1
-  done
+  group_list+=("$idx")
+  group_members[$idx]="${group_pms[*]}"
 done
 
+# Run groups in parallel, serialize inside each group
+PIDS=()
+for idx in "${group_list[@]}"; do
+  (
+    for pm in ${group_members[$idx]}; do
+      cmd="${updaters[$pm]}"
+      if [[ " ${root_required[*]} " == *" $pm "* ]]; then
+        cmd="sudo bash -lc \"$cmd\""
+      else
+        cmd="bash -lc \"$cmd\""
+      fi
+
+      if $VERBOSE; then
+        eval "$cmd"
+      else
+        eval "$cmd" &>/dev/null
+      fi
+
+      status=$?
+      # Remove from visible list
+      tmp=()
+      for v in "${VISIBLE_MANAGERS[@]}"; do
+        [[ "$v" == "$pm" ]] || tmp+=("$v")
+      done
+      VISIBLE_MANAGERS=("${tmp[@]}")
+
+      ((COMPLETED++))
+      [[ $status -ne 0 ]] && FAILURES+=("$pm")
+      draw_ui "$COMPLETED" "$TOTAL"
+    done
+  ) &
+  PIDS+=("$!")
+done
+
+# Wait for all groups to finish
+for pid in "${PIDS[@]}"; do
+  wait "$pid"
+done
+
+# Finalize HUD and report
 draw_ui "$TOTAL" "$TOTAL"
 tput cup "$(tput lines 2>/dev/null || echo 24)" 0 2>/dev/null || true
 echo -e "\n${GREEN}✔ Updates finished.${RESET}"
